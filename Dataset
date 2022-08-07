@@ -1,0 +1,373 @@
+'''
+    Dataset
+
+    解析数据集xml文件，提取信息 ➡ 读取train和valid的图片和xml信息，创建用于训练和测试的json文件
+    ➡ 处理图像，读取的一张张图片及其object信息整合成batch的形式 ➡ 使用Dataset构建数据集 ➡ 使用DataLoader读取数据
+'''
+
+# """python
+#     create_data_lists
+# """
+# from utils import create_data_lists
+#
+# if __name__ == '__main__':
+#     # voc07_path，voc12_path为我们训练测试所需要用到的数据集，output_folder为我们生成构建dataloader所需文件的路径
+#     # 参数中涉及的路径以个人实际路径为准，建议将数据集放到dataset目录下，和教程保持一致
+#     create_data_lists(voc07_path='D:/3Python3.7/Scripts/Deep Learning_practice/Track/VOCdevkit/VOC2007',
+#                       voc12_path='D:/3Python3.7/Scripts/Deep Learning_practice/Track/VOCdevkit/VOC2012',
+#                       output_folder='D:/3Python3.7/Scripts/Deep Learning_practice/Track/VOCdevkit')
+from torch import random
+
+"""
+    xml文件解析
+"""
+
+import xml.etree.ElementTree as ET    #解析xml文件所用工具
+import torchvision.transforms.functional as FT
+import torch
+from torch.utils.data import Dataset
+import json
+import os
+from PIL import Image
+from utils import transform, expand, random_crop, photometric_distort, flip, resize
+
+# GPU设置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Label map
+# voc_labels为VOC数据集中20类目标的类别名称
+voc_labels = ('aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow', 'diningtable',
+              'dog', 'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor')
+
+# 创建label_map字典，用于存储类别和类别索引之间的映射关系。比如：{1：'aeroplane'， 2：'bicycle'，......}
+label_map = {k: v + 1 for v, k in enumerate(voc_labels)}
+# VOC数据集默认不含有20类目标中的其中一类的图片的类别为background，类别索引设置为0
+label_map['background'] = 0
+
+# 将映射关系倒过来，{类别名称：类别索引}
+rev_label_map = {v: k for k, v in label_map.items()}  # Inverse mapping
+
+
+# 解析xml文件，最终返回这张图片中所有目标的标注框及其类别信息，以及这个目标是否是一个difficult目标
+def parse_annotation(annotation_path):
+    # 解析xml
+    tree = ET.parse(annotation_path)
+    root = tree.getroot()
+
+    boxes = list()  # 存储bbox
+    labels = list()  # 存储bbox对应的label
+    difficulties = list()  # 存储bbox对应的difficult信息
+
+    # 遍历xml文件中所有的object，前面说了，有多少个object就有多少个目标
+    for object in root.iter('object'):
+        # 提取每个object的difficult、label、bbox信息
+        difficult = int(object.find('difficult').text == '1')
+        label = object.find('name').text.lower().strip()
+        if label not in label_map:
+            continue
+        bbox = object.find('bndbox')
+        xmin = int(bbox.find('xmin').text) - 1
+        ymin = int(bbox.find('ymin').text) - 1
+        xmax = int(bbox.find('xmax').text) - 1
+        ymax = int(bbox.find('ymax').text) - 1
+        # 存储
+        boxes.append([xmin, ymin, xmax, ymax])
+        labels.append(label_map[label])
+        difficulties.append(difficult)
+
+    # 返回包含图片标注信息的字典
+    return {'boxes': boxes, 'labels': labels, 'difficulties': difficulties}
+
+
+"""
+    分别读取train和valid的图片和xml信息，创建用于训练和测试的json文件
+"""
+
+
+def create_data_lists(voc07_path, voc12_path, output_folder):
+    """
+    Create lists of images, the bounding boxes and labels of the objects in these images, and save these to file.
+    :param voc07_path: path to the 'VOC2007' folder
+    :param voc12_path: path to the 'VOC2012' folder
+    :param output_folder: folder where the JSONs must be saved
+    """
+
+    # 获取voc2007和voc2012数据集的绝对路径
+    voc07_path = os.path.abspath(voc07_path)
+    voc12_path = os.path.abspath(voc12_path)
+
+    train_images = list()
+    train_objects = list()
+    n_objects = 0
+
+    # Training data
+    for path in [voc07_path, voc12_path]:
+
+        # Find IDs of images in training data
+        # 获取训练所用的train和val数据的图片id
+        with open(os.path.join(path, 'ImageSets/Main/trainval.txt')) as f:
+            ids = f.read().splitlines()
+
+        # 根据图片id，解析图片的xml文件，获取标注信息
+        for id in ids:
+            # Parse annotation's XML file
+            objects = parse_annotation(os.path.join(path, 'Annotations', id + '.xml'))
+            if len(objects['boxes']) == 0:  # 如果没有目标则跳过
+                continue
+            n_objects += len(objects['boxes'])  # 统计目标总数
+            train_objects.append(objects)  # 存储每张图片的标注信息到列表train_objects
+            train_images.append(os.path.join(path, 'JPEGImages', id + '.jpg'))  # 存储每张图片的路径到列表train_images，用于读取图片
+
+    assert len(train_objects) == len(train_images)  # 检查图片数量和标注信息量是否相等，相等才继续执行程序
+
+    # Save to file
+    # 将训练数据的图片路径，标注信息，类别映射信息，分别保存为json文件
+    with open(os.path.join(output_folder, 'TRAIN_images.json'), 'w') as j:
+        json.dump(train_images, j)
+    with open(os.path.join(output_folder, 'TRAIN_objects.json'), 'w') as j:
+        json.dump(train_objects, j)
+    with open(os.path.join(output_folder, 'label_map.json'), 'w') as j:
+        json.dump(label_map, j)  # save label map too
+
+    print('\nThere are %d training images containing a total of %d objects. Files have been saved to %s.' % (
+        len(train_images), n_objects, os.path.abspath(output_folder)))
+
+    # 与Train data一样，目的是将测试数据的图片路径，标注信息，类别映射信息，分别保存为json文件，参考上面的注释理解
+    # Test data
+    test_images = list()
+    test_objects = list()
+    n_objects = 0
+
+    # Find IDs of images in the test data
+    with open(os.path.join(voc07_path, 'ImageSets/Main/test.txt')) as f:
+        ids = f.read().splitlines()
+
+    for id in ids:
+        # Parse annotation's XML file
+        objects = parse_annotation(os.path.join(voc07_path, 'Annotations', id + '.xml'))
+        if len(objects['boxes']) == 0:
+            continue
+        test_objects.append(objects)
+        n_objects += len(objects['boxes'])
+        test_images.append(os.path.join(voc07_path, 'JPEGImages', id + '.jpg'))
+
+    assert len(test_objects) == len(test_images)
+
+    # Save to file
+    with open(os.path.join(output_folder, 'TEST_images.json'), 'w') as j:
+        json.dump(test_images, j)
+    with open(os.path.join(output_folder, 'TEST_objects.json'), 'w') as j:
+        json.dump(test_objects, j)
+
+    print('\nThere are %d test images containing a total of %d objects. Files have been saved to %s.' % (
+        len(test_images), n_objects, os.path.abspath(output_folder)))
+
+
+"""
+    PascalVOCDataset具体实现过程
+"""
+
+
+
+class PascalVOCDataset(Dataset):
+
+    """
+    A PyTorch Dataset class to be used in a PyTorch DataLoader to create batches.
+    """
+
+    # 初始化相关变量
+    # 读取images和objects标注信息
+    def __init__(self, data_folder, split, keep_difficult=False):
+        """
+        :param data_folder: folder where data files are stored
+        :param split: split, one of 'TRAIN' or 'TEST'
+        :param keep_difficult: keep or discard objects that are considered difficult to detect?
+        """
+        self.split = split.upper()  # 保证输入为纯大写字母，便于匹配{'TRAIN', 'TEST'}
+
+        assert self.split in {'TRAIN', 'TEST'}
+
+        self.data_folder = data_folder
+        self.keep_difficult = keep_difficult
+
+        # Read data files
+        with open(os.path.join(data_folder, self.split + '_images.json'), 'r') as j:
+            self.images = json.load(j)
+        with open(os.path.join(data_folder, self.split + '_objects.json'), 'r') as j:
+            self.objects = json.load(j)
+
+        assert len(self.images) == len(self.objects)
+
+    # 循环读取image及对应objects
+    # 对读取的image及objects进行tranform操作（数据增广）
+    # 返回PIL格式图像，标注框，标注框对应的类别索引，对应的difficult标志(True or False)
+    def __getitem__(self, i):
+        # Read image
+        # 由于torchvision.transform中有关数据增强的方法接收的都是PIL格式的图片
+        # 因此一般来说我们使用PIL.Image.open()读取img
+        # 此时得到的是四通道的RGBA图像，因此一般转化为RGB图像
+        # 但是如果要使用torchvision.transform中的方法，需要提前转为PIL格式
+        image = Image.open(self.images[i], mode='r')
+        image = image.convert('RGB')
+
+        # Read objects in this image (bounding boxes, labels, difficulties)
+        objects = self.objects[i]
+        boxes = torch.FloatTensor(objects['boxes'])  # (n_objects, 4)
+        labels = torch.LongTensor(objects['labels'])  # (n_objects)
+        difficulties = torch.ByteTensor(objects['difficulties'])  # (n_objects)
+
+        # Discard difficult objects, if desired
+        # 如果self.keep_difficult为False,即不保留difficult标志为True的目标
+        # 那么这里将对应的目标删去
+        if not self.keep_difficult:
+            boxes = boxes[1 - difficulties]
+            labels = labels[1 - difficulties]
+            difficulties = difficulties[1 - difficulties]
+
+        # Apply transformations
+        # 对读取的图片应用transform
+        image, boxes, labels, difficulties = transform(image, boxes, labels, difficulties, split=self.split)
+
+        return image, boxes, labels, difficulties
+
+    # 获取图片的总数，用于计算batch数
+    def __len__(self):
+        return len(self.images)
+
+    # 我们知道，我们输入到网络中训练的数据通常是一个batch一起输入，而通过__getitem__我们只读取了一张图片及其objects信息
+    # 如何将读取的一张张图片及其object信息整合成batch的形式呢？
+    # collate_fn就是做这个事情，
+    # 对于一个batch的images，collate_fn通过torch.stack()将其整合成4维tensor，对应的objects信息分别用一个list存储
+    def collate_fn(self, batch):
+        """
+        Since each image may have a different number of objects, we need a collate function (to be passed to the DataLoader).
+        This describes how to combine these tensors of different sizes. We use lists.
+        Note: this need not be defined in this Class, can be standalone.
+        :param batch: an iterable of N sets from __getitem__()
+        :return: a tensor of images, lists of varying-size tensors of bounding boxes, labels, and difficulties
+        """
+
+        images = list()
+        boxes = list()
+        labels = list()
+        difficulties = list()
+
+        for b in batch:
+            images.append(b[0])
+            boxes.append(b[1])
+            labels.append(b[2])
+            difficulties.append(b[3])
+
+        # (3,224,224) -> (N,3,224,224)
+        images = torch.stack(images, dim=0)
+
+        return images, boxes, labels, difficulties  # tensor (N, 3, 224, 224), 3 lists of N tensors each
+
+train_dataset = PascalVOCDataset(data_folder,
+                                     split='train',
+                                     keep_difficult=keep_difficult)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True,
+                                               collate_fn=train_dataset.collate_fn, num_workers=0,
+                                               pin_memory=True)  # note that we're passing the collate function here
+
+
+# """python
+#     transform操作是训练模型中一项非常重要的工作，其中不仅包含数据增强以提升模型性能的相关操作，也包含如数据类型转换(PIL to Tensor)、归一化(Normalize)这些必要操作。
+# """
+# import json
+# import os
+# import torch
+# import random
+# import xml.etree.ElementTree as ET
+# import torchvision.transforms.functional as FT
+#
+# """
+# 可以看到，transform分为TRAIN和TEST两种模式，以本实验为例：
+#
+# 在TRAIN时进行的transform有：
+# 1.以随机顺序改变图片亮度，对比度，饱和度和色相，每种都有50％的概率被执行。photometric_distort
+# 2.扩大目标，expand
+# 3.随机裁剪图片，random_crop
+# 4.0.5的概率进行图片翻转，flip
+# *注意：a. 第一种transform属于像素级别的图像增强，目标相对于图片的位置没有改变，因此bbox坐标不需要变化。
+#          但是2，3，4，5都属于图片的几何变化，目标相对于图片的位置被改变，因此bbox坐标要进行相应变化。
+#
+# 在TRAIN和TEST时都要进行的transform有：
+# 1.统一图像大小到(224,224)，resize
+# 2.PIL to Tensor
+# 3.归一化，FT.normalize()
+#
+# 注1: resize也是一种几何变化，要知道应用数据增强策略时，哪些属于几何变化，哪些属于像素变化
+# 注2: PIL to Tensor操作，normalize操作必须执行
+# """
+#
+
+def transform(image, boxes, labels, difficulties, split):
+    """
+    Apply the transformations above.
+    :param image: image, a PIL Image
+    :param boxes: bounding boxes in boundary coordinates, a tensor of dimensions (n_objects, 4)
+    :param labels: labels of objects, a tensor of dimensions (n_objects)
+    :param difficulties: difficulties of detection of these objects, a tensor of dimensions (n_objects)
+    :param split: one of 'TRAIN' or 'TEST', since different sets of transformations are applied
+    :return: transformed image, transformed bounding box coordinates, transformed labels, transformed difficulties
+    """
+
+    # 在训练和测试时使用的transform策略往往不完全相同，所以需要split变量指明是TRAIN还是TEST时的transform方法
+    assert split in {'TRAIN', 'TEST'}
+
+    # Mean and standard deviation of ImageNet data that our base VGG from torchvision was trained on
+    # see: https://pytorch.org/docs/stable/torchvision/models.html
+    # 为了防止由于图片之间像素差异过大而导致的训练不稳定问题，图片在送入网络训练之间需要进行归一化
+    # 对所有图片各通道求mean和std来获得
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    new_image = image
+    new_boxes = boxes
+    new_labels = labels
+    new_difficulties = difficulties
+
+    # Skip the following operations for evaluation/testing
+    if split == 'TRAIN':
+        # A series of photometric distortions in random order, each with 50% chance of occurrence, as in Caffe repo
+        new_image = photometric_distort(new_image)
+
+        # Convert PIL image to Torch tensor
+        new_image = FT.to_tensor(new_image)
+
+        # Expand image (zoom out) with a 50% chance - helpful for training detection of small objects
+        # Fill surrounding space with the mean of ImageNet data that our base VGG was trained on
+        if random.random() < 0.5:
+            new_image, new_boxes = expand(new_image, boxes, filler=mean)
+
+        # Randomly crop image (zoom in)
+        new_image, new_boxes, new_labels, new_difficulties = random_crop(new_image, new_boxes, new_labels,
+                                                                         new_difficulties)
+
+        # Convert Torch tensor to PIL image
+        new_image = FT.to_pil_image(new_image)
+
+        # Flip image with a 50% chance
+        if random.random() < 0.5:
+            new_image, new_boxes = flip(new_image, new_boxes)
+
+    # Resize image to (224, 224) - this also converts absolute boundary coordinates to their fractional form
+    new_image, new_boxes = resize(new_image, new_boxes, dims=(224, 224))
+
+    # Convert PIL image to Torch tensor
+    new_image = FT.to_tensor(new_image)
+
+    # Normalize by mean and standard deviation of ImageNet data that our base VGG was trained on
+    new_image = FT.normalize(new_image, mean=mean, std=std)
+
+    return new_image, new_boxes, new_labels, new_difficulties
+
+"""
+    DataLoader
+"""
+
+#pin_memory，在计算机内存充足的时候设置为True可以加快内存中的tensor转换到GPU的速度，详见：http://www.voidcn.com/article/p-fsdktdik-bry.html
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True,
+                                           collate_fn=train_dataset.collate_fn, num_workers=0,
+                                           pin_memory=True)  # note that we're passing the collate function here
